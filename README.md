@@ -37,3 +37,50 @@ After training the models, results can be analyzed with the following two notebo
 `jobs/run_temperatures.sh` contais commands that need to be run to reproduce the experiments with the tempereatures datasets
 
 After training the models, results can be analyzes with `evaluation/evaluate_temperature.ipynb`
+
+
+## FlowNP baseline (NP vs INP vs FlowNP)
+
+This fork adds a **FlowNP** baseline integrated into the same `./saves/<project>/<run>_<N>/` layout
+so the existing evaluation notebooks can load it side-by-side with NP and INP.
+
+### Train FlowNP on the distribution-shift sinusoids dataset
+
+```bash
+python baselines/train_flownp_trending_sinusoids_dist_shift.py \
+  --project-name INPs_sinusoids \
+  --dataset set-trending-sinusoids-dist-shift \
+  --knowledge-type b \
+  --use-knowledge True \
+  --batch-size 64 \
+  --num-epochs 200 \
+  --lr 1e-4 \
+  --noise 0.2 \
+  --min-num-context 0 \
+  --max-num-context 10 \
+  --num-targets 100 \
+  --test-num-z-samples 32 \
+  --run-name-prefix flownp_dist_shift \
+  --seed 0
+```
+
+This will create a folder like:
+
+```
+./saves/INPs_sinusoids/flownp_dist_shift_0/
+  config.toml
+  model_best.pt
+  model_last.pt
+```
+
+### Evaluate (distribution shift)
+
+Open:
+
+- `evaluation/evaluate_sinusoids_dist_shift.ipynb`
+
+The notebook auto-selects the **latest run folder** for each model prefix under `../saves/INPs_sinusoids/`.
+
+Notes:
+- FlowNP ignores `knowledge` internally; it is treated as a **model-free baseline**.
+- The evaluation uses the same `NLL` estimator in `models/loss.py` by treating FlowNP samples as mixture components.

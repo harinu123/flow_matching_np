@@ -2,7 +2,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(os.path.join(__file__, os.pardir))))
-from models.inp import INP
+from models.flownp import FlowNP
 import torch
 from config import Config
 from models.loss import NLL
@@ -22,10 +22,18 @@ EVAL_CONFIGS = {
 
 def _load_model(config, save_dir, load_it="best"):
     print(save_dir)
-    model = INP(config)
+    model_type = getattr(config, "model_type", None) or getattr(config, "model", None) or "inp"
+    model_type = str(model_type).lower()
+
+    if model_type in ["flownp", "fnp", "flow_np", "flow-neural-process", "flowneuralprocess"]:
+        model = FlowNP(config)
+    else:
+        from models.inp import INP
+        model = INP(config)
+
     model.to(config.device)
     model.eval()
-    state_dict = torch.load(f"{save_dir}/model_{load_it}.pt")
+    state_dict = torch.load(f"{save_dir}/model_{load_it}.pt", map_location=config.device)
     model.load_state_dict(state_dict)
     return model
 
