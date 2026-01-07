@@ -1,7 +1,4 @@
-*__pycache__*
-*results*
-*evalsets*
-*datasets*
-# pixi environments
-.pixi/*
-!.pixi/config.toml
+saves/**
+**/__pycache__/**
+wandb/**
+figures/*

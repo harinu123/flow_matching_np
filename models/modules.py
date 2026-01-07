@@ -1,342 +1,404 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from torch.distributions import Normal
-from models.attention import MultiHeadAttn, SelfAttn
-
-
-__all__ = ['PoolingEncoder', 'CrossAttnEncoder', 'Decoder']
+from torch.nn import MultiheadAttention
+from transformers import RobertaModel, RobertaTokenizer
 
 
-def build_mlp(dim_in, dim_hid, dim_out, depth):
-    modules = [nn.Linear(dim_in, dim_hid), nn.ReLU(True)]
-    for _ in range(depth-2):
-        modules.append(nn.Linear(dim_hid, dim_hid))
-        modules.append(nn.ReLU(True))
-    modules.append(nn.Linear(dim_hid, dim_out))
-    return nn.Sequential(*modules)
+class MLP(nn.Module):
+    def __init__(
+        self, input_size, hidden_size, num_hidden, output_size, activation=nn.GELU()
+    ):
+        super(MLP, self).__init__()
+        self.layers = nn.ModuleList(
+            (
+                [nn.Linear(input_size, hidden_size)]
+                + [nn.Linear(hidden_size, hidden_size) for _ in range(num_hidden - 1)]
+                + [nn.Linear(hidden_size, output_size)]
+            )
+        )
+        self.activation = activation
+
+    def forward(self, x):
+        for layer in self.layers[:-1]:
+            x = self.activation(layer(x))
+        x = self.layers[-1](x)
+        return x
 
 
-class PoolingEncoder(nn.Module):
+class XEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.mlp = MLP(
+            input_size=config.input_dim,
+            hidden_size=config.hidden_dim,
+            num_hidden=config.x_encoder_num_hidden,
+            output_size=config.x_transf_dim,
+        )
 
-    def __init__(self, dim_x=1, dim_y=1,
-            dim_hid=128, dim_lat=None, self_attn=False,
-            pre_depth=4, post_depth=2):
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class XYEncoder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.pairer = MLP(
+            input_size=config.x_transf_dim + config.output_dim,
+            hidden_size=config.xy_encoder_hidden_dim,
+            num_hidden=config.xy_encoder_num_hidden,
+            output_size=config.hidden_dim,
+        )
+        if config.data_agg_func == "cross-attention":
+            self.cross_attention = MultiheadAttention(
+                config.hidden_dim,
+                num_heads=4,
+                batch_first=True,
+            )
+
+        self.config = config
+
+    def forward(self, x_context, y_context, x_target):
+        """
+        Encode the context set all together
+        """
+        xy = torch.cat([x_context, y_context], dim=-1)
+        Rs = self.pairer(xy)
+        # aggregate
+        if self.config.data_agg_func == "mean":
+            R = torch.mean(Rs, dim=1, keepdim=True)  # [bs, 1, r_dim]
+        elif self.config.data_agg_func == "sum":
+            R = torch.sum(Rs, dim=1, keepdim=True)
+        elif self.config.data_agg_func == "cross-attention":
+            Rs = self.cross_attention(x_target, x_context, Rs)[0]
+            R = torch.mean(Rs, dim=1, keepdim=True)
+        return R
+
+
+class RoBERTa(nn.Module):
+    def __init__(self, config):
+        super(RoBERTa, self).__init__()
+
+        self.dim_model = 768
+        self.llm = RobertaModel.from_pretrained("roberta-base")
+
+        if config.freeze_llm:
+            for name, param in self.llm.named_parameters():
+                param.requires_grad = False
+
+        if config.tune_llm_layer_norms:
+            for name, param in self.llm.named_parameters():
+                if "LayerNorm" in name:
+                    param.requires_grad = True
+
+        for name, param in self.llm.named_parameters():
+            if name == "pooler.dense.weight" or name == "pooler.dense.bias":
+                param.requires_grad = True
+
+        self.device = config.device
+        self.tokenizer = RobertaTokenizer.from_pretrained(
+            "roberta-base", truncation=True, do_lower_case=True
+        )
+
+    def forward(self, knowledge):
+        knowledge = self.tokenizer.batch_encode_plus(
+            knowledge,
+            return_tensors="pt",
+            return_token_type_ids=True,
+            padding=True,
+            truncation=True,
+        )
+
+        input_ids = knowledge["input_ids"].to(self.device)
+        attention_mask = knowledge["attention_mask"].to(self.device)
+        token_type_ids = knowledge["token_type_ids"].to(self.device)
+
+        llm_output = self.llm(
+            input_ids=input_ids.squeeze(1),
+            attention_mask=attention_mask.squeeze(1),
+            token_type_ids=token_type_ids.squeeze(1),
+        )
+        hidden_state = llm_output[0]
+        output = hidden_state[:, 0]
+        return output
+
+
+class NoEmbedding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim_model = config.knowledge_input_dim
+        self.device = config.device
+
+    def forward(self, knowledge):
+        # check if tensor
+        if isinstance(knowledge, torch.Tensor):
+            return knowledge.to(self.device)
+        else:
+            return torch.stack(knowledge).float().to(self.device)
+
+
+class SimpleEmbedding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim_model = config.num_classes
+        self.embedding = nn.Embedding(
+            num_embeddings=self.dim_model,
+            embedding_dim=self.dim_model,
+        )
+
+    def forward(self, knowledge):
+        knowledge = torch.tensor(knowledge).long().to(self.embedding.weight.device)
+        return self.embedding(knowledge)
+
+
+class SetEmbedding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dim_model = config.knowledge_dim
+        self.device = config.device
+        self.h1 = MLP(
+            input_size=config.knowledge_input_dim,
+            hidden_size=config.knowledge_dim,
+            num_hidden=1,
+            output_size=config.knowledge_dim,
+        )
+        self.h2 = MLP(
+            input_size=config.knowledge_dim,
+            hidden_size=config.knowledge_dim,
+            num_hidden=1,
+            output_size=config.knowledge_dim,
+        )
+
+    def forward(self, knowledge):
+        knowledge = knowledge.to(self.device)
+        ks = self.h1(knowledge)
+        k = torch.sum(ks, dim=1, keepdim=True)
+        k = self.h2(k)
+        return k
+
+
+class KnowledgeEncoder(nn.Module):
+    def __init__(self, config):
+        super(KnowledgeEncoder, self).__init__()
+        if config.text_encoder == "roberta":
+            self.text_encoder = RoBERTa(config)
+        elif config.text_encoder == "simple":
+            self.text_encoder = SimpleEmbedding(config)
+        elif config.text_encoder == "none":
+            self.text_encoder = NoEmbedding(config)
+        elif config.text_encoder == "set":
+            self.text_encoder = SetEmbedding(config)
+
+        if config.knowledge_extractor_num_hidden > 0:
+            self.knowledge_extractor = MLP(
+                input_size=self.text_encoder.dim_model,
+                hidden_size=config.knowledge_dim,
+                num_hidden=config.knowledge_extractor_num_hidden,
+                output_size=config.knowledge_dim,
+            )
+        else:
+            self.knowledge_extractor = nn.Linear(
+                self.text_encoder.dim_model, config.knowledge_dim
+            )
+        self.config = config
+
+    def forward(self, knowledge):
+        text_representation = self.text_encoder(knowledge)
+        k = self.knowledge_extractor(text_representation)
+        if k.dim() == 2:
+            k = k.unsqueeze(1)
+        return k
+
+
+class LatentEncoder(nn.Module):
+    def __init__(self, config):
         super().__init__()
 
-        self.use_lat = dim_lat is not None
+        self.knowledge_dim = config.knowledge_dim
+        self.knowledge_dropout = config.knowledge_dropout
 
-        self.net_pre = build_mlp(dim_x+dim_y, dim_hid, dim_hid, pre_depth) \
-                if not self_attn else \
-                nn.Sequential(
-                        build_mlp(dim_x+dim_y, dim_hid, dim_hid, pre_depth-2),
-                        nn.ReLU(True),
-                        SelfAttn(dim_hid, dim_hid))
+        if config.use_knowledge:
+            self.knowledge_encoder = KnowledgeEncoder(config)
+        else:
+            self.knowledge_encoder = None
 
-        self.net_post = build_mlp(dim_hid, dim_hid,
-                2*dim_lat if self.use_lat else dim_hid,
-                post_depth)
+        if config.knowledge_merge == "poe":
+            self.k_proj = (
+                nn.Identity()
+                if config.knowledge_dim == config.hidden_dim
+                else nn.Linear(config.knowledge_dim, config.hidden_dim)
+            )
 
-    def forward(self, xc, yc, mask=None):
-            out = self.net_pre(torch.cat([xc, yc], -1))  # [B,N,Eh]
-            if mask is None:
-                out = out.mean(-2)  # [B,Eh]
+            if config.latent_encoder_num_hidden > 0:
+                self.encoder_data = MLP(
+                    input_size=config.hidden_dim,
+                    hidden_size=config.hidden_dim,
+                    num_hidden=config.latent_encoder_num_hidden,
+                    output_size=2 * config.hidden_dim,
+                )
+                self.encoder_know = MLP(
+                    input_size=config.hidden_dim,
+                    hidden_size=config.hidden_dim,
+                    num_hidden=config.latent_encoder_num_hidden,
+                    output_size=2 * config.hidden_dim,
+                )
             else:
-                mask = mask.to(xc.device)
-                out = (out * mask.unsqueeze(-1)).sum(-2) / \
-                        (mask.sum(-1, keepdim=True).detach() + 1e-5)
-            if self.use_lat:
-                mu, sigma = self.net_post(out).chunk(2, -1)
-                sigma = 0.1 + 0.9 * torch.sigmoid(sigma)
-                return Normal(mu, sigma)
+                self.encoder_data = nn.Linear(config.hidden_dim, 2 * config.hidden_dim)
+                self.encoder_know = nn.Linear(config.hidden_dim, 2 * config.hidden_dim)
+
+            trust_in_dim = 4 * config.hidden_dim
+            if config.knowledge_trust_num_hidden > 0:
+                self.trust_net = MLP(
+                    trust_in_dim,
+                    config.knowledge_trust_hidden_dim,
+                    config.knowledge_trust_num_hidden,
+                    1,
+                )
             else:
-                return self.net_post(out)  # [B,Eh]
+                self.trust_net = nn.Linear(trust_in_dim, 1)
+            self.last_aux = {}
 
+        elif config.knowledge_merge == "sum":
+            input_dim = config.hidden_dim
 
-class CrossAttnEncoder(nn.Module):
+        elif config.knowledge_merge == "concat":
+            input_dim = config.hidden_dim + config.knowledge_dim
 
-    def __init__(self, dim_x=1, dim_y=1, dim_hid=128,
-            dim_lat=None, self_attn=True,
-            v_depth=4, qk_depth=2):
-        super().__init__()
-        self.use_lat = dim_lat is not None
+        elif config.knowledge_merge == "mlp":
+            input_dim = config.hidden_dim
+            self.knowledge_merger = MLP(
+                input_size=config.hidden_dim + config.knowledge_dim,
+                hidden_size=config.hidden_dim,
+                num_hidden=1,
+                output_size=config.hidden_dim,
+            )
 
-        if not self_attn:
-            self.net_v = build_mlp(dim_x+dim_y, dim_hid, dim_hid, v_depth)
         else:
-            self.net_v = build_mlp(dim_x+dim_y, dim_hid, dim_hid, v_depth-2)
-            self.self_attn = SelfAttn(dim_hid, dim_hid)
+            raise NotImplementedError
 
-        self.net_qk = build_mlp(dim_x, dim_hid, dim_hid, qk_depth)
+        if config.knowledge_merge != "poe":
+            if config.latent_encoder_num_hidden > 0:
+                self.encoder = MLP(
+                    input_size=input_dim,
+                    hidden_size=config.hidden_dim,
+                    num_hidden=config.latent_encoder_num_hidden,
+                    output_size=2 * config.hidden_dim,
+                )
+            else:
+                self.encoder = nn.Linear(input_dim, 2 * config.hidden_dim)
+        self.config = config
 
-        self.attn = MultiHeadAttn(dim_hid, dim_hid, dim_hid,
-                2*dim_lat if self.use_lat else dim_hid)
+    def _bounded_scale(self, rho):
+        return 0.01 + 0.99 * F.softplus(rho)
 
-    def forward(self, xc, yc, xt, mask=None):
-        q, k = self.net_qk(xt), self.net_qk(xc)
-        v = self.net_v(torch.cat([xc, yc], -1))
+    def _inv_bounded_scale(self, scale, eps=1e-6):
+        y = (scale - 0.01) / 0.99
+        y = torch.clamp(y, min=eps)
+        return torch.log(torch.expm1(y) + eps)
 
-        if hasattr(self, 'self_attn'):
-            v = self.self_attn(v, mask=mask)
+    def forward(self, R, knowledge, n, tag="Cc"):
+        """
+        Infer the latent distribution given the global representation
+        """
+        drop_knowledge = torch.rand(1, device=R.device) < self.knowledge_dropout
+        knowledge_available = (
+            self.config.use_knowledge
+            and (knowledge is not None)
+            and (not drop_knowledge)
+            and (self.knowledge_encoder is not None)
+        )
 
-        out = self.attn(q, k, v, mask=mask)
-        if self.use_lat:
-            mu, sigma = out.chunk(2, -1)
-            sigma = 0.1 + 0.9 * torch.sigmoid(sigma)
-            return Normal(mu, sigma)
+        if knowledge_available:
+            k = self.knowledge_encoder(knowledge)
         else:
-            return out
+            k = torch.zeros((R.shape[0], 1, self.knowledge_dim), device=R.device)
 
-class NeuCrossAttnEncoder(nn.Module):
+        if self.config.knowledge_merge == "poe":
+            k_r = self.k_proj(k)
 
-    def __init__(self, dim_x=1, dim_y=1, dim_hid=128,
-            dim_lat=None, self_attn=True,
-            v_depth=4, qk_depth=2):
-        super().__init__()
-        self.use_lat = dim_lat is not None
+            data_stats = self.encoder_data(R)
+            know_stats = self.encoder_know(k_r)
+            mu_D, rho_D = data_stats.split(self.config.hidden_dim, dim=-1)
+            mu_K, rho_K = know_stats.split(self.config.hidden_dim, dim=-1)
 
-        if not self_attn:
-            self.net_v = build_mlp(dim_x+dim_y, dim_hid, dim_hid, v_depth)
-        else:
-            self.net_v = build_mlp(dim_x+dim_y, dim_hid, dim_hid, v_depth-2)
-            self.self_attn = SelfAttn(dim_hid, dim_hid)
+            sigma_D = self._bounded_scale(rho_D)
+            sigma_K = self._bounded_scale(rho_K)
+            var_D = sigma_D ** 2
+            var_K = sigma_K ** 2
+            tau_D = 1 / var_D
+            tau_K = 1 / var_K
 
-        self.net_qk = build_mlp(dim_x, dim_hid, dim_hid, qk_depth)
+            if knowledge_available:
+                trust_features = torch.cat(
+                    [R, k_r, torch.abs(R - k_r), R * k_r], dim=-1
+                )
+                trust_logit = self.trust_net(trust_features)
+                lam = torch.sigmoid(trust_logit)
+            else:
+                trust_logit = torch.full(
+                    (R.shape[0], 1, 1), -10.0, device=R.device
+                )
+                lam = torch.zeros_like(trust_logit)
 
-        self.attn = MultiHeadAttn(dim_hid, dim_hid, dim_hid,
-                2*dim_lat if self.use_lat else dim_hid)
+            tau = tau_D + lam * tau_K
+            mu = (tau_D * mu_D + lam * tau_K * mu_K) / tau
+            var = 1 / tau
+            sigma = torch.sqrt(var)
+            rho = self._inv_bounded_scale(sigma)
 
-    def forward(self, xc, yc, xt, w, mask=None):
-        q, k = self.net_qk(xt), self.net_qk(xc)
-        v = self.net_v(torch.cat([xc, yc], -1))
+            q_z_stats = torch.cat([mu, rho], dim=-1)
 
-        if hasattr(self, 'self_attn'):
-            v = self.self_attn(v, mask=mask)
-        v = v * w
-        out = self.attn(q, k, v, mask=mask)
-        if self.use_lat:
-            mu, sigma = out.chunk(2, -1)
-            sigma = 0.1 + 0.9 * torch.sigmoid(sigma)
-            return Normal(mu, sigma)
-        else:
-            return out
+            if hasattr(self, "last_aux"):
+                self.last_aux[tag] = {
+                    "trust_logit": trust_logit.detach(),
+                    "trust": lam.detach(),
+                    "drop_knowledge": bool(drop_knowledge),
+                }
+            return q_z_stats
+
+        if self.config.knowledge_merge == "sum":
+            encoder_input = F.relu(R + k)
+
+        elif self.config.knowledge_merge == "concat":
+            encoder_input = torch.cat([R, k], dim=-1)
+
+        elif self.config.knowledge_merge == "mlp":
+            if knowledge is not None and not drop_knowledge:
+                encoder_input = self.knowledge_merger(torch.cat([R, k], dim=-1))
+            else:
+                encoder_input = F.relu(R)
+
+        q_z_stats = self.encoder(encoder_input)
+
+        return q_z_stats
+
+    def get_knowledge_embedding(self, knowledge):
+        return self.knowledge_encoder(knowledge).unsqueeze(1)
+
 
 class Decoder(nn.Module):
-    def __init__(self, dim_x=1, dim_y=1,
-            dim_enc=128, dim_hid=128, depth=3, neuboots=False, sigma_bound=0.):
+    def __init__(self, config):
         super().__init__()
-        self.fc = nn.Linear(dim_x+dim_enc, dim_hid)
-        self.dim_hid = dim_hid
-        self.neuboots = neuboots
-        self.sigma_bound = sigma_bound
-
-        modules = [nn.ReLU(True)]
-        for _ in range(depth-2):
-            modules.append(nn.Linear(dim_hid, dim_hid))
-            modules.append(nn.ReLU(True))
-        modules.append(nn.Linear(dim_hid, dim_y if neuboots else 2*dim_y))
-        self.mlp = nn.Sequential(*modules)
-
-    def add_ctx(self, dim_ctx):
-        self.dim_ctx = dim_ctx
-        self.fc_ctx = nn.Linear(dim_ctx, self.dim_hid, bias=False)
-
-    def forward(self, encoded, x, ctx=None):
-
-        packed = torch.cat([encoded, x], -1)  # [B,(Nbs,)Nt,2Eh+Dx]
-        hid = self.fc(packed)  # [B,(Nbs,)Nt,Dh]
-        if ctx is not None:
-            hid = hid + self.fc_ctx(ctx)  # [B,(Nbs,)Nt,Dh]
-        out = self.mlp(hid)  # [B,(Nbs,)Nt,2Dy]
-        if self.neuboots:
-            return out  # [B,(Nbs,)Nt,2Dy]
+        if config.decoder_activation == "relu":
+            activation = nn.ReLU()
         else:
-            mu, sigma = out.chunk(2, -1)  # [B,Nt,Dy] each
-            sigma = self.sigma_bound + (1.-self.sigma_bound) * F.softplus(sigma)
-            return Normal(mu, sigma)  # Normal([B,Nt,Dy])
+            activation = nn.GELU()
+        self.mlp = MLP(
+            input_size=config.hidden_dim + config.x_transf_dim,
+            hidden_size=config.decoder_hidden_dim,
+            num_hidden=config.decoder_num_hidden,
+            output_size=2 * config.output_dim,
+            activation=activation,
+        )
 
-
-class NeuBootsEncoder(nn.Module):
-
-    def   __init__(self, dim_x=1, dim_y=1,
-            dim_hid=128, dim_lat=None, self_attn=False,
-            pre_depth=4, post_depth=2,
-            yenc=True, wenc=True, wagg=True):
-        super().__init__()
-
-        self.use_lat = dim_lat is not None
-        self.yenc = yenc
-        self.wenc = wenc
-        self.wagg = wagg
-        dim_in = dim_x
-        if yenc:
-            dim_in += dim_y
-        if wenc:
-            dim_in += 1
-
-        if self.wagg == 'l2a':
-            self.agg = nn.Linear(dim_hid,dim_hid)
-            self.agg_activation = nn.ReLU()
-
-        self.net_pre = build_mlp(dim_in, dim_hid, dim_hid, pre_depth) \
-                if not self_attn else \
-                nn.Sequential(
-                        build_mlp(dim_in, dim_hid, dim_hid, pre_depth-2),
-                        nn.ReLU(True),
-                        SelfAttn(dim_hid, dim_hid))
-
-        self.net_post = build_mlp(dim_hid, dim_hid,
-                2*dim_lat if self.use_lat else dim_hid,
-                post_depth)
-
-    def forward(self, xc, yc=None, w=None):
-
-        device = xc.device
-        if not self.yenc:
-            _yc = torch.tensor([]).to(device)
-        else:
-            _yc = yc
-        if not self.wenc:
-            _w = torch.tensor([]).to(device)
-        else:
-            _w = w
-
-        # xc: [B,Nbs,N,Dx]
-        # yc: [B,Nbs,N,Dy]
-        # w: [B,Nbs,N,1]
+    def forward(self, x_target, R_target):
         """
-        Encoder
+        Decode the target set given the target dependent representation
+
+        R_target [num_samples, bs, num_targets, hidden_dim]
+        x_target [bs, num_targets, input_dim]
         """
-        input = torch.cat([xc, _yc, _w], -1)  # [B,Nbs,N,?]
-        output = self.net_pre(input)  # [B,Nbs,N,Eh]
-
-        """
-        Aggregation
-        """
-        if self.wagg == 'mean':
-            out = (output * w).mean(-2)  # [B,Nbs,Eh]
-        elif self.wagg == 'max':
-            out = (output * w).max(-2).values
-        elif self.wagg == 'l2a':
-            out = self.agg_activation(self.agg(output * w)).max(dim=-2).values
-        else:
-            out = output.mean(-2)   # --wagg None
-            # [B,Nbs,Eh] : aggregation of context repr
-
-        """
-        Decoder
-        """
-        if self.use_lat:
-            mu, sigma = self.net_post(out).chunk(2, -1)
-            sigma = 0.1 + 0.9 * torch.sigmoid(sigma)
-            return Normal(mu, sigma)
-        else:
-            return self.net_post(out)  # [B,Eh]
-
-
-class CouplingLayer(nn.Module):
-  """
-  Implementation of the affine coupling layer in RealNVP
-  paper.
-  """
-
-  def __init__(self, d_inp, d_model, nhead, dim_feedforward, orientation, num_layers):
-    super().__init__()
-
-    self.orientation = orientation
-
-    self.embedder = build_mlp(d_inp, d_model, d_model, 2)
-    encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout=0.0, batch_first=True)
-    self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-    self.ffn = build_mlp(d_model, dim_feedforward, d_inp*2, 2)
-
-    self.scale_net = build_mlp(d_model, dim_feedforward, d_inp, 2)
-
-  def coupling(self, x):
-    embeddings = self.embedder(x)
-    out_encoder = self.encoder(embeddings)
-    s_t = self.ffn(out_encoder)
-    scale = torch.sigmoid(self.scale_net(out_encoder))
-    return s_t, scale
-
-  def forward(self, x, logdet, invert=False):
-    if not invert:
-      x1, x2, mask = self.split(x)
-      out, scale = self.coupling(x1)
-      t, log_s = torch.chunk(out, 2, dim=-1)
-      log_s = torch.tanh(log_s) / scale
-      s = torch.exp(log_s)
-      logdet += torch.sum(log_s.view(s.shape[0], -1), dim=-1)
-      y1, y2 = x1, s * (x2 + t)
-      return self.merge(y1, y2, mask), logdet
-
-    # Inverse affine coupling layer
-    y1, y2, mask = self.split(x)
-    out, scale = self.coupling(y1)
-    t, log_s = torch.chunk(out, 2, dim=-1)
-    log_s = torch.tanh(log_s) / scale
-    s = torch.exp(log_s)
-    logdet -= torch.sum(log_s.view(s.shape[0], -1), dim=-1)
-    x1, x2 = y1, y2 / s - t
-    return self.merge(x1, x2, mask), logdet
-
-  def split(self, x):
-    assert x.shape[1] % 2 == 0
-    device = x.device
-    mask = torch.zeros(x.shape[1], device=device)
-    mask[::2] = 1.
-    if self.orientation:
-      mask = 1. - mask     # flip mask orientation
-
-    x1, x2 = x[:, mask.bool()], x[:, (1-mask).bool()]
-    return x1, x2, mask
-
-  def merge(self, x1, x2, mask):
-    device = x1.device
-    x = torch.zeros((x2.shape[0], x1.shape[1]*2, x1.shape[2]), device=device)
-    x[:, mask.bool()] = x1
-    x[:, (1-mask).bool()] = x2
-    return x
-
-class NICE(nn.Module):
-  def __init__(self, d_inp, d_model, nhead, dim_feedforward, num_layers_coupling=2, num_coupling_layers=2):
-    super().__init__()
-
-    # alternating mask orientations for consecutive coupling layers
-    mask_orientations = [(i % 2 == 0) for i in range(num_coupling_layers)]
-
-    self.coupling_layers = nn.ModuleList([
-        CouplingLayer(
-            d_inp, d_model, nhead, dim_feedforward, mask_orientations[i], num_layers_coupling
-        ) for i in range(num_coupling_layers)
-    ])
-
-
-  def forward(self, x, invert=False):
-    if not invert:
-      z, log_det_jacobian = self.f(x)
-      return z, log_det_jacobian
-
-    return self.f_inverse(x)
-
-  def f(self, x):
-    z = x
-    log_det_jacobian = 0
-    for i, coupling_layer in enumerate(self.coupling_layers):
-      z, log_det_jacobian = coupling_layer(z, log_det_jacobian)
-    return z, log_det_jacobian
-
-  def f_inverse(self, z):
-    x = z
-    for i, coupling_layer in reversed(list(enumerate(self.coupling_layers))):
-      x, _ = coupling_layer(x, 0, invert=True)
-    return x
-
-# nice = NICE(1, 10, 1, 20, 2, 4).cuda()
-# y = torch.randn((2, 4, 1), device='cuda')
-# z, logdet = nice(y)
-# y_prime = nice(z, True)
-# print (y)
-# print (z)
-# print (y_prime)
+        x_target = x_target.unsqueeze(0).expand(R_target.shape[0], -1, -1, -1)
+        XR_target = torch.cat([x_target, R_target], dim=-1)
+        p_y_stats = self.mlp(XR_target)
+        return p_y_stats
